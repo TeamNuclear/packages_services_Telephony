@@ -20,9 +20,6 @@ import java.util.List;
 import java.util.Calendar;
 
 import android.app.Service;
-import android.app.PendingIntent;
-import android.app.PendingIntent.CanceledException;
-import android.app.AlarmManager;
 import android.os.Handler;
 import android.os.Message;
 import android.os.Bundle;
@@ -62,36 +59,39 @@ public class TeloRadioService extends Service
      /** DEFINES
       * 	* Thank's TheMasterBaron for ACTION_ and NETWORK_MODE_ defines
       **/
-    private static final String ACTION_NETWORK_MODE_CHANGED 	= "com.android.internal.telephony.NETWORK_MODE_CHANGED";
-    private static final String CHANGE_NETWORK_MODE_PERM 		= "com.android.phone.CHANGE_NETWORK_MODE";
-    private static final String ACTION_TELORADIO_2G		 		= "com.android.phone.action.TELORADIO_2G";
-    private static final String EXTRA_NETWORK_MODE 				= "networkMode";
+    public static final String ACTION_NETWORK_MODE_CHANGED 	= "com.android.internal.telephony.NETWORK_MODE_CHANGED";
+    public static final String CHANGE_NETWORK_MODE_PERM 	= "com.android.phone.CHANGE_NETWORK_MODE";
+    public static final String EXTRA_NETWORK_MODE 			= "networkMode";
     
-	private static final int INTERNET_DISABLE 	= 0;
-	private static final int INTERNET_WIFI 		= 1;
-	private static final int INTERNET_MOBILE 	= 2;
+    public static final int NETWORK_MODE_GSM_ONLY 		= 1; /* GSM only */
+    public static final int NETWORK_MODE_GSM_UMTS 		= 3; /* GSM/WCDMA (auto mode) */
+    public static final int NETWORK_MODE_LTE_GSM_WCDMA  = 9; /* LTE,GSM,WCDMA (auto mode) */
+    
+	public static final int INTERNET_DISABLE 	= 0;
+	public static final int INTERNET_WIFI 		= 1;
+	public static final int INTERNET_MOBILE 	= 2;
 	
-	private static final int TELORADIO_PREF_ENABLE 			= 1;
-	private static final int TELORADIO_PREF_LTE 			= 2;
-	private static final int TELORADIO_PREF_2G_WIFI 		= 3;
-	private static final int TELORADIO_PREF_2G_SCREENOFF 	= 4;
-	private static final int TELORADIO_PREF_3G_UNLOCK		= 5;
+	public static final int TELORADIO_PREF_ENABLE 		= 1;
+	public static final int TELORADIO_PREF_LTE 			= 2;
+	public static final int TELORADIO_PREF_2G_WIFI 		= 3;
+	public static final int TELORADIO_PREF_2G_SCREENOFF = 4;
+	public static final int TELORADIO_PREF_3G_UNLOCK	= 5;
 	
     private TeloRadioNetworkReceiver mNetWorkReceiver;
+    private TeloRadioTimerReceiver mTimerReceiver;
+    private boolean mTimerRunning = false;
     private TeloRadioLockReceiver mLockReceiver;
     private boolean mLockRunning = false;
-    private boolean mCanTimer2G = true;
     private TeloRadioUnLockReceiver mUnLockReceiver;
     private boolean mUnLockRunning = false;
-    private TeloRadio2GTimerReceiver m2GTimerReceiver;
-    private boolean m2GTimerRunning = false;
-    private boolean in2GScreenOff = false;
     private SettingsObserver mSettingsObserver;
     private IPowerManager mPM;
+    private Context mContext;
 	
-	private final boolean mDebug = true;
-	private int mTeloRadioNetworkMode = 0;
-    private long m2GScreenOffTime = 0L;
+	private static final boolean mDebug = true;
+	private int mNetworkMode = NETWORK_MODE_GSM_UMTS;
+    private long m2GScreenOffTime = 600000L;
+    private long mTimeInScreenOff = 0L;
 	
 	/**
      * 	SETTINGS OBSERVER
@@ -122,30 +122,30 @@ public class TeloRadioService extends Service
 	private void UpdatePrefs() {
 		ContentResolver resolver = getContentResolver();
 		
-		switch (isConnectedTo(this)) {
+		switch (isConnectedTo(mContext)) {
 			case INTERNET_WIFI:
 				if (getBooleanPrefs(TELORADIO_PREF_2G_WIFI))
-					changeNetworkMode(Phone.NT_MODE_GSM_ONLY, null, false);
+					changeNetworkMode(Phone.NT_MODE_GSM_ONLY);
 				else if (getBooleanPrefs(TELORADIO_PREF_LTE))
-					changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA, null, false);
+					changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA);
 				else
-					changeNetworkMode(Phone.NT_MODE_GSM_UMTS, null, false);
+					changeNetworkMode(Phone.NT_MODE_GSM_UMTS);
 				break;
 			case INTERNET_MOBILE:
 				if (getBooleanPrefs(TELORADIO_PREF_LTE))
-					changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA, null, false);
+					changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA);
 				else
-					changeNetworkMode(Phone.NT_MODE_GSM_UMTS, null, false);
+					changeNetworkMode(Phone.NT_MODE_GSM_ONLY);
 				break;
 		}
 
 		if (getBooleanPrefs(TELORADIO_PREF_2G_SCREENOFF)) {
-			m2GScreenOffTime = Settings.System.getLong(resolver, Settings.System.TELO_RADIO_2G_SCREENOFF_TIME, 600000L);
 			registerLockReceiver();
 			registerUnLockReceiver();
 		} else {
 			unregisterLockReceiver();
 			unregisterUnLockReceiver();
+			unregisterTimerReceiver();
 		}
 	}
 
@@ -196,6 +196,7 @@ public class TeloRadioService extends Service
          
 		if (mDebug) Log.i(TAG, "TeloRadio: SERVICE START");
 		
+		mContext = this;
         mPM = IPowerManager.Stub.asInterface(ServiceManager.getService(Context.POWER_SERVICE));
 		
 		IntentFilter mConnectivityIntent = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
@@ -213,7 +214,7 @@ public class TeloRadioService extends Service
 		unregisterReceiver(mNetWorkReceiver);
 		unregisterLockReceiver();
 		unregisterUnLockReceiver();
-		unregister2GTimerReceiver();
+		unregisterTimerReceiver();	
 		getContentResolver().unregisterContentObserver(mSettingsObserver);
 	}	
 	
@@ -242,7 +243,7 @@ public class TeloRadioService extends Service
         
         private void handleGetPreferredNetworkTypeResponse(Message msg) {
 			Intent intent = new Intent(ACTION_NETWORK_MODE_CHANGED);
-			intent.putExtra(EXTRA_NETWORK_MODE, mTeloRadioNetworkMode);
+			intent.putExtra(EXTRA_NETWORK_MODE, mNetworkMode);
 			mPhone.getContext().sendBroadcast(intent, CHANGE_NETWORK_MODE_PERM);
         }
         
@@ -254,7 +255,6 @@ public class TeloRadioService extends Service
     /**
      * 	JOB FUNCTIONS IN CONNECTION AND NETWORK RECEIVER
      * 		* int isConnectedTo(Context context) 
-     * 		* int getNetworkMode()
      * 		* void changeNetworkMode(int modemNetworkMode)
      * 		* boolean canChangeNetworkMode()
      **/
@@ -262,19 +262,22 @@ public class TeloRadioService extends Service
     public class TeloRadioNetworkReceiver extends BroadcastReceiver {
 		@Override
         public void onReceive(Context context, Intent intent) {
-			if (!getBooleanPrefs(TELORADIO_PREF_ENABLE) || !canChangeNetworkMode(context))
+			if (!getBooleanPrefs(TELORADIO_PREF_ENABLE))
 				return;
 
             switch(isConnectedTo(context)) {
 				case INTERNET_WIFI:
 					if (getBooleanPrefs(TELORADIO_PREF_2G_WIFI))
-						changeNetworkMode(Phone.NT_MODE_GSM_ONLY, context, false);
+						changeNetworkMode(Phone.NT_MODE_GSM_ONLY);
 					break;
 				case INTERNET_MOBILE:
 					if (getBooleanPrefs(TELORADIO_PREF_LTE))
-						changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA, context, true);
+						changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA);
 					else
-						changeNetworkMode(Phone.NT_MODE_GSM_UMTS, context, true);
+						changeNetworkMode(Phone.NT_MODE_GSM_UMTS);
+					break;
+				case INTERNET_DISABLE:
+					if (mDebug) Log.i(TAG, "TeloRadio: NETWORK RECEIVER not wifi or data mobile");
 					break;
 			}
         }
@@ -293,75 +296,66 @@ public class TeloRadioService extends Service
 		}
 		return INTERNET_DISABLE;
 	}
-    
-    private int getNetworkMode() {
-		TelephonyManager tm = (TelephonyManager) this.getApplicationContext().getSystemService(Context.TELEPHONY_SERVICE);
-		return tm.getNetworkType();
-	}
     	
-	private void changeNetworkMode(int modemNetworkMode, Context context, boolean restriction) {
-		if (restriction && !canChangeNetworkMode(context))
-			return;
-			
-		if (getNetworkMode() == modemNetworkMode)
-			return;
-		
-		mTeloRadioNetworkMode = modemNetworkMode;
-		
-		if (mDebug) Log.i(TAG, "TeloRadio: CHANGE NETWORK MODE - New mode: " + mTeloRadioNetworkMode + ".");
+	private void changeNetworkMode(int modemNetworkMode) {
+		mNetworkMode = modemNetworkMode;
 		getPhone().setPreferredNetworkType(modemNetworkMode, getHandler().obtainMessage(MyHandler.MESSAGE_SET_PREFERRED_NETWORK_TYPE));
     } 
     
     private boolean canChangeNetworkMode(Context context) {
-		if (getNetworkMode() == Phone.NT_MODE_GSM_ONLY && isConnectedTo(context) == INTERNET_WIFI && getBooleanPrefs(TELORADIO_PREF_2G_WIFI))
-			return false;
-			
-		if (in2GScreenOff)
+		if (isConnectedTo(context) == INTERNET_WIFI && getBooleanPrefs(TELORADIO_PREF_2G_WIFI))
 			return false;
 			
 		return true;
 	}
-  
+         
     /**
-     * 	2GTIMER RECEIVER
+     * 	TIMER RECEIVER
      * 		* void onReceive(Context context, Intent intent)
-     * 		* void register2GTimerReceiver()
-     * 		* void unregister2GTimerReceiver()
+     * 		* void registerTimerReceiver()
+     * 		* void unregisterTimerReceiver()
+     * 		* boolean screenOff2GFinish()
      **/
-       
-	private class TeloRadio2GTimerReceiver extends BroadcastReceiver {
-		
+     
+    public class TeloRadioTimerReceiver extends BroadcastReceiver {    
         @Override
         public void onReceive(Context context, Intent intent) {
-			if (mDebug) Log.i(TAG, "TeloRadio: 2GTIMER execute");
-			
-			in2GScreenOff = true;
-			changeNetworkMode(Phone.NT_MODE_GSM_ONLY, context, false);
+			if (mDebug) Log.i(TAG, "TeloRadio: TIMER RECEIVER");
+			if (!screenOff2GFinish())
+				return;
+				
+			if (mDebug) Log.i(TAG, "TeloRadio: TIMER RECEIVER change 2G");
+			changeNetworkMode(NETWORK_MODE_GSM_ONLY);
+			unregisterTimerReceiver();
         }
     };
-       
-    private void register2GTimerReceiver() {
-		if (m2GTimerRunning)
+    
+    private void registerTimerReceiver() {
+		if (mTimerRunning)
 			return;
 			
-		m2GTimerReceiver = new TeloRadio2GTimerReceiver();
-        IntentFilter filter = new IntentFilter(ACTION_TELORADIO_2G);
-        registerReceiver(m2GTimerReceiver, filter);
-        m2GTimerRunning = true;
+		mTimerReceiver = new TeloRadioTimerReceiver();
+		IntentFilter filter = new IntentFilter(Intent.ACTION_TIME_TICK);
+		registerReceiver(mTimerReceiver, filter);
+		mTimerRunning = true;
+	}
+    
+	private void unregisterTimerReceiver() {
+		if (!mTimerRunning)
+			return;
+			
+		mTimerRunning = false;
+		unregisterReceiver(mTimerReceiver);
     }
     
-    private void unregister2GTimerReceiver() {
-		if (!m2GTimerRunning)
-			return;
-			
-		m2GTimerRunning = false;
-        unregisterReceiver(m2GTimerReceiver);
-    }
-             
+    private boolean screenOff2GFinish() {
+		m2GScreenOffTime = Settings.System.getLong(getContentResolver(), Settings.System.TELO_RADIO_2G_SCREENOFF_TIME, 600000L);
+		return mTimeInScreenOff + m2GScreenOffTime < System.currentTimeMillis();
+	}
+    
     /**
      * 	LOCK RECEIVER
      * 		* void onReceive(Context context, Intent intent)
-     * 		* void updateTimerTo2G()
      * 		* void registerLockReceiver()
      * 		* void unregisterLockReceiver()
      **/
@@ -372,33 +366,14 @@ public class TeloRadioService extends Service
         public void onReceive(Context context, Intent intent) {
 			if (mDebug) Log.i(TAG, "TeloRadio: LOCK RECEIVER execute");
 			
-			if (!canChangeNetworkMode(context))
+			if (!getBooleanPrefs(TELORADIO_PREF_2G_SCREENOFF))
 				return;
-			
-			updateTimerTo2G();
+				
+			mTimeInScreenOff = System.currentTimeMillis();
+			registerTimerReceiver();	
         }
     };
     
-	private void updateTimerTo2G() {
-		if (!mCanTimer2G)
-			return;
-		register2GTimerReceiver();
-		
-		if (mDebug) Log.i(TAG, "TeloRadio: SCREENOFF: Change to 2G in " + m2GScreenOffTime + " ms");
-        AlarmManager am = (AlarmManager)this.getApplicationContext().getSystemService(Context.ALARM_SERVICE);
-        Intent i = new Intent(ACTION_TELORADIO_2G);
-        PendingIntent pi = PendingIntent.getBroadcast(this.getApplicationContext(), 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
-        try {
-            am.cancel(pi);
-        } catch (Exception e) {
-        }
-        Calendar time = Calendar.getInstance();
-        time.setTimeInMillis(System.currentTimeMillis() + m2GScreenOffTime);
-        am.set(AlarmManager.RTC, time.getTimeInMillis(), pi);
-        
-		mCanTimer2G = false;
-    }
-       
     private void registerLockReceiver() {
 		if (mLockRunning)
 			return;
@@ -420,7 +395,6 @@ public class TeloRadioService extends Service
     /**
      * 	UNLOCK RECEIVER
      * 		* void onReceive(Context context, Intent intent)
-     * 		* void cancelTimerTo2G()
      * 		* void registerUnLockReceiver()
      * 		* void unregisterUnLockReceiver()
      * 		* boolean isScreenOn()
@@ -433,42 +407,32 @@ public class TeloRadioService extends Service
             String action = intent.getAction();
             if (!isScreenOn())
 				return;
+							
 			if (mDebug) Log.i(TAG, "TeloRadio: UNLOCK RECEIVER execute");
+			unregisterTimerReceiver();	
 			
-			in2GScreenOff = false;
-			cancelTimerTo2G();
+			if (!getBooleanPrefs(TELORADIO_PREF_2G_SCREENOFF))
+				return;
 				
-			if (!getBooleanPrefs(TELORADIO_PREF_3G_UNLOCK)) {
+			if (!getBooleanPrefs(TELORADIO_PREF_3G_UNLOCK) && canChangeNetworkMode(context)) {
 				if (mDebug) Log.i(TAG, "TeloRadio: UNLOCK RECEIVER change 3G/LTE when screen lock");
 				if (getBooleanPrefs(TELORADIO_PREF_LTE))
-					changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA, context, true);
+					changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA);
 				else
-					changeNetworkMode(Phone.NT_MODE_GSM_UMTS, context, true);
-			} else if (action.equals(Intent.ACTION_USER_PRESENT)) {
+					changeNetworkMode(Phone.NT_MODE_GSM_UMTS);
+			}
+				
+			if (action.equals(Intent.ACTION_USER_PRESENT))
+				if (getBooleanPrefs(TELORADIO_PREF_3G_UNLOCK) && canChangeNetworkMode(context)) {
 					if (mDebug) Log.i(TAG, "TeloRadio: UNLOCK RECEIVER change 3G/LTE when screen unlock");
 					if (getBooleanPrefs(TELORADIO_PREF_LTE))
-						changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA, context, true);
+						changeNetworkMode(Phone.NT_MODE_LTE_GSM_WCDMA);
 					else
-						changeNetworkMode(Phone.NT_MODE_GSM_UMTS, context, true);					
-			}
+						changeNetworkMode(Phone.NT_MODE_GSM_UMTS);					
+				}
         }
     };
     
-    private void cancelTimerTo2G() {
-		if (mCanTimer2G)
-			return;
-			
-        AlarmManager am = (AlarmManager)this.getApplicationContext().getSystemService(Context.ALARM_SERVICE);
-        Intent i = new Intent(ACTION_TELORADIO_2G);
-        PendingIntent pi = PendingIntent.getBroadcast(this.getApplicationContext(), 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
-        try {
-            am.cancel(pi);
-        } catch (Exception e) {
-        }
-        unregister2GTimerReceiver();
-		mCanTimer2G = true;
-    }
-        
     private void registerUnLockReceiver() {
 		if (mUnLockRunning)
 			return;
